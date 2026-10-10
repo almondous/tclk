@@ -1,0 +1,127 @@
+name: PR203 native redirect supplement verification
+run-name: Verify PR203 supplement on Node 22
+
+on:
+  push:
+    branches: [ci/pr203-native-redirects-20261010]
+
+permissions:
+  contents: read
+
+env:
+  PRODUCT_SHA: b1500e88c463d7f697291741c01274f4c9e2dffc
+  AUTHOR_SHA: 869bfd224721ebd7619722d09e046c54da4554b9
+  PRODUCT_TREE: d6ff9a68e0d08fc66972b9c87e00fada3d444dbe
+  TEST_PATH: mcp/tests/redirects.test.ts
+  TEST_SHA256: c326236bd4538c79f7fade19c92d112ee7abf2ebed549409c50aff540d699711
+  WRANGLER_SEND_METRICS: "false"
+  CLOUDFLARE_SEND_METRICS: "false"
+
+jobs:
+  verify:
+    name: Exact supplement identity, build, tests, and Worker dry-run
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out exact product commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PRODUCT_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify exact product tree and preserve all 84 author files
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCODE'
+          import hashlib, os, pathlib, subprocess
+          def git(*args):
+              return subprocess.check_output(["git", *args], text=True).strip()
+          def entries(ref):
+              data = subprocess.check_output(["git", "ls-tree", "-r", "-z", ref])
+              result = {}
+              for entry in data.split(b"\0"):
+                  if entry:
+                      metadata, path = entry.split(b"\t", 1)
+                      result[path.decode()] = metadata.decode()
+              return result
+          product = os.environ["PRODUCT_SHA"]
+          author = os.environ["AUTHOR_SHA"]
+          expected_tree = os.environ["PRODUCT_TREE"]
+          test_path = os.environ["TEST_PATH"]
+          assert git("rev-parse", "HEAD") == product, "Wrong checked-out commit"
+          assert git("rev-parse", "HEAD^{tree}") == expected_tree, "Wrong product tree"
+          assert git("show", "-s", "--format=%P", product) == author, "Unexpected product parent(s)"
+          before, after = entries(author), entries(product)
+          assert len(before) == 84, f"Expected 84 author files; got {len(before)}"
+          assert all(after.get(path) == value for path, value in before.items()), "An author blob or mode changed"
+          assert set(after) - set(before) == {test_path}, "Unexpected added files"
+          assert len(after) == 85, f"Expected 85 product files; got {len(after)}"
+          actual_hash = hashlib.sha256(pathlib.Path(test_path).read_bytes()).hexdigest()
+          assert actual_hash == os.environ["TEST_SHA256"], "Approved test bytes changed"
+          event = os.environ["GITHUB_SHA"]
+          print(f"Workflow event commit: {event}")
+          print(f"Checked-out product commit: {product}")
+          print(f"Checked-out product tree: {expected_tree}")
+          print(f"Author commit: {author}")
+          print(f"Author files preserved: {len(before)}")
+          print(f"Only added file: {test_path} (SHA256 {actual_hash})")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(f"Workflow event commit: `{event}`\n\nChecked-out product commit: `{product}`\n\nProduct tree: `{expected_tree}`\n\nAll 84 author files preserved; only `{test_path}` added.\n")
+          PYCODE
+
+      - name: Scan product and verification commit messages
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$PRODUCT_SHA" "$GITHUB_SHA"
+          mapfile -t shas < <(git rev-list "$AUTHOR_SHA..$GITHUB_SHA")
+          test "${#shas[@]}" -ge 2
+          for sha in "${shas[@]}"; do
+            git log -1 --format=%B "$sha" | ./scripts/no-agent-trailers.sh
+          done
+
+      # Match upstream CI: package.json supplies pnpm@11.25.0.
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Verify runtime versions
+        run: |
+          node -e 'if (process.versions.node.split(".")[0] !== "22") process.exit(1); console.log(process.version)'
+          test "$(pnpm --version)" = "11.25.0"
+          pnpm --version
+      - name: Frozen dependency install
+        run: pnpm install --frozen-lockfile
+      - name: Build all packages including root
+        run: pnpm -r --include-workspace-root build
+      - name: Test all packages including root
+        run: pnpm -r --include-workspace-root test
+
+      - name: Strictly typecheck the added test and its imports
+        shell: bash
+        run: |
+          set -euo pipefail
+          config=.tclk-pr203-ci-tsconfig.json
+          trap 'rm -f "$config"' EXIT
+          cat > "$config" <<'JSON'
+          {
+            "extends": "./tsconfig.base.json",
+            "compilerOptions": {
+              "noEmit": true,
+              "declaration": false,
+              "sourceMap": false,
+              "types": ["node"]
+            },
+            "include": ["mcp/tests/redirects.test.ts"]
+          }
+          JSON
+          pnpm exec tsc -p "$config"
+
+      - name: Typecheck and bundle Worker without deploying
+        run: pnpm --filter @flop-labs/tclk-mcp build:worker
+
+      - name: Check tracked sources remained unchanged
+        run: git diff --exit-code HEAD --
